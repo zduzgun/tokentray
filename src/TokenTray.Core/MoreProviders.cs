@@ -46,6 +46,7 @@ public sealed class AntigravityProvider(Func<string?>? readCredential = null) : 
             return ProviderSnapshot.Failed(Id, SnapshotStatus.TokenExpired, "Antigravity's sign-in has expired. Open Antigravity once and it will refresh.") with { Account = account };
 
         var auth = false; var lastError = "Antigravity quota service didn't answer.";
+        ProviderSnapshot? partial = null;
         foreach (var baseUrl in Endpoints)
         {
             var (o1, s1, load) = await Post(baseUrl + "/v1internal:loadCodeAssist", """{"metadata":{"ideType":"ANTIGRAVITY"}}""", token, ct);
@@ -63,8 +64,13 @@ public sealed class AntigravityProvider(Func<string?>? readCredential = null) : 
             var (o2, s2, summary) = await Post(baseUrl + "/v1internal:retrieveUserQuotaSummary", JsonSerializer.Serialize(new { project }), token, ct);
             if (o2 == Http.Outcome.Auth) { auth = true; continue; }
             if (o2 != Http.Outcome.Ok) { lastError = $"Antigravity quota summary returned {s2}."; continue; }
-            return Parse(summary, DateTimeOffset.Now) with { Plan = plan, Account = account, Email = account };
+            var snap = Parse(summary, DateTimeOffset.Now) with { Plan = plan, Account = account, Email = account };
+            // An endpoint can answer without the Gemini group (daily-cloudcode-pa does for clients it
+            // doesn't recognise); ask the next one before settling for the other pools alone.
+            if (snap.Status == SnapshotStatus.Ok && snap.Windows.Any(w => w.Group is null)) return snap;
+            if (snap.Status == SnapshotStatus.Ok) partial ??= snap;
         }
+        if (partial is not null) return partial;
         return auth
             ? ProviderSnapshot.Failed(Id, SnapshotStatus.TokenExpired, "Antigravity rejected the sign-in. Open Antigravity once to refresh it.") with { Account = account }
             : ProviderSnapshot.Failed(Id, SnapshotStatus.Error, lastError) with { Account = account };
@@ -95,9 +101,9 @@ public sealed class AntigravityProvider(Func<string?>? readCredential = null) : 
         if (doc.RootElement.TryGetProperty("groups", out var groups) && groups.ValueKind == JsonValueKind.Array)
         {
             var list = groups.EnumerateArray().ToList();
+            // Only the Gemini group is the main allowance. Without it every group keeps its name,
+            // so the Claude and GPT pool is never shown as if it were Gemini's.
             var main = list.FindIndex(g => IsGemini(g) && !IsArgonGroup(g));
-            if (main < 0) main = list.FindIndex(g => !IsArgonGroup(g));
-            if (main < 0) main = 0;
             for (var i = 0; i < list.Count; i++)
             {
                 var g = list[i];

@@ -93,6 +93,22 @@ public class MoreProviderTests
     }
 
     [Fact]
+    public void Antigravity_without_the_gemini_group_never_passes_another_pool_off_as_gemini()
+    {
+        // daily-cloudcode-pa's answer to a client it doesn't recognise, trimmed from a live response.
+        var s = AntigravityProvider.Parse("""
+        {"groups":[{"buckets":[
+            {"bucketId":"3p-weekly","displayName":"Weekly Limit Remaining","window":"weekly","resetTime":"2026-10-24T14:49:32Z","remainingFraction":0.7},
+            {"bucketId":"3p-5h","displayName":"Five Hour Limit Remaining","window":"5h","resetTime":"2026-10-17T19:49:32Z","remainingFraction":1}],
+          "displayName":"Claude and GPT models","description":"Models within this group: Claude Opus, Claude Sonnet, GPT-OSS"}]}
+        """, Now);
+        Assert.Equal(SnapshotStatus.Ok, s.Status);
+        Assert.Equal(2, s.Windows.Count(w => w.Group == "Claude and GPT"));
+        Assert.Empty(s.Windows.Where(w => w.Group is null));
+        Assert.Equal(30, s.Binding!.UsedPercent, 1);
+    }
+
+    [Fact]
     public void Antigravity_without_buckets_is_an_error()
     {
         Assert.Equal(SnapshotStatus.Error, AntigravityProvider.Parse("""{"groups":[]}""", Now).Status);
