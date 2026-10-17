@@ -99,7 +99,8 @@ public sealed class AntigravityProvider(
     {
         using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        req.Headers.UserAgent.ParseAdd("antigravity");
+        // daily-cloudcode-pa gates the Gemini group on an IDE version and the Argon group on a current build cl.
+        req.Headers.UserAgent.ParseAdd("antigravity/2.24.0 (aidev_client; cl=999999999)");
         return await Http.Send(req, ct);
     }
 
@@ -204,20 +205,21 @@ public static class AntigravityLocal
         foreach (var (pid, key) in Servers())
             foreach (var port in ListeningPorts(pid))
             {
-                var quota = await Call(port, key, "RetrieveUserQuotaSummary", "\"groups\"", ct);
+                // Without forceRefresh the language server returns its cached reading until the user opens its usage panel.
+                var quota = await Call(port, key, "RetrieveUserQuotaSummary", """{"forceRefresh":true}""", "\"groups\"", ct);
                 if (quota is null) continue;
-                var status = await Call(port, key, "GetUserStatus", "\"userStatus\"", ct);
+                var status = await Call(port, key, "GetUserStatus", "{}", "\"userStatus\"", ct);
                 return new Answer(quota, StatusField(status, "email"), StatusTier(status));
             }
         return null;
     }
 
-    static async Task<string?> Call(int port, string key, string method, string mustContain, CancellationToken ct)
+    static async Task<string?> Call(int port, string key, string method, string bodyJson, string mustContain, CancellationToken ct)
     {
         try
         {
             using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{port}{Service}{method}")
-            { Content = new StringContent("{}", Encoding.UTF8, "application/json") };
+            { Content = new StringContent(bodyJson, Encoding.UTF8, "application/json") };
             req.Headers.Add("x-codeium-csrf-token", key);
             req.Headers.Add("Connect-Protocol-Version", "1");
             using var res = await Local.SendAsync(req, ct);
