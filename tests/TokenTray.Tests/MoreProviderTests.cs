@@ -108,6 +108,48 @@ public class MoreProviderTests
         Assert.Equal(30, s.Binding!.UsedPercent, 1);
     }
 
+    // The running app's language server, trimmed from a live RetrieveUserQuotaSummary answer.
+    const string AntigravityLocalJson = """
+    {"response":{"groups":[
+      {"displayName":"Gemini Models","description":"Models within this group: Gemini Flash, Gemini Pro","buckets":[
+        {"bucketId":"gemini-weekly","displayName":"Weekly Limit Remaining","window":"weekly","remainingFraction":0.9,"resetTime":"2026-10-24T15:17:42Z"},
+        {"bucketId":"gemini-5h","displayName":"Five Hour Limit Remaining","window":"5h","remainingFraction":1,"resetTime":"2026-10-17T20:17:42Z"}]},
+      {"displayName":"Claude and GPT models","description":"Models within this group: Claude Opus, Claude Sonnet, GPT-OSS","buckets":[
+        {"bucketId":"3p-weekly","displayName":"Weekly Limit Remaining","window":"weekly","remainingFraction":1,"resetTime":"2026-10-24T15:17:42Z"},
+        {"bucketId":"3p-5h","displayName":"Five Hour Limit Remaining","window":"5h","remainingFraction":1,"resetTime":"2026-10-17T20:17:42Z"}]},
+      {"displayName":"Gemini 4 Argon","description":"For paid Pro plans, Argon quota is separate.","buckets":[
+        {"bucketId":"gemini-argon-wtu-weekly","displayName":"Gemini 4 Argon Weekly Limit","window":"weekly","remainingFraction":0.35,"resetTime":"2026-10-24T15:17:42Z"}]}]}}
+    """;
+
+    [Fact]
+    public void Antigravity_local_answer_is_unwrapped_and_shows_argon()
+    {
+        var s = AntigravityProvider.Parse(AntigravityLocalJson, Now);
+        Assert.Equal(10, s.Get(WindowKind.Weekly)!.UsedPercent, 1);
+        Assert.Null(s.Get(WindowKind.Weekly)!.Group);
+        Assert.Equal(65, s.Windows.Single(w => w.Group == "Argon").UsedPercent, 1);
+        Assert.Equal(2, s.Windows.Count(w => w.Group == "Claude and GPT"));
+    }
+
+    static string FakeAntigravityCredential(string email)
+    {
+        static string B64(string json) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(json)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        var idToken = $"{B64("{}")}.{B64($$"""{"email":"{{email}}"}""")}.sig";
+        return $$"""{"token":{"access_token":"x","expiry":"2099-01-01T00:00:00Z"},"id_token":"{{idToken}}"}""";
+    }
+
+    [Fact]
+    public async Task Antigravity_uses_the_running_app_for_the_same_account()
+    {
+        var p = new AntigravityProvider(() => FakeAntigravityCredential("me@example.com"),
+            _ => Task.FromResult<AntigravityLocal.Answer?>(new(AntigravityLocalJson, "Me@Example.com", "Google AI Pro")));
+        var s = await p.FetchAsync(CancellationToken.None);
+        Assert.Equal(SnapshotStatus.Ok, s.Status);
+        Assert.Equal("Google AI Pro", s.Plan);
+        Assert.Equal("Me@Example.com", s.Account);
+        Assert.Single(s.Windows.Where(w => w.Group == "Argon"));
+    }
+
     [Fact]
     public void Antigravity_without_buckets_is_an_error()
     {
