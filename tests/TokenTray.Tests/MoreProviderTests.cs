@@ -31,6 +31,67 @@ public class MoreProviderTests
         Assert.Equal(WindowKind.Weekly, s.Binding!.Kind);
     }
 
+    // Gemini 4 Argon: its own weekly-only quota on AI Pro, separate from the Gemini pool.
+    const string AntigravityArgonGroupJson = """
+    {"groups":[
+      {"buckets":[
+        {"bucketId":"argon-weekly","window":"weekly","resetTime":"2026-10-03T09:00:00Z","remainingFraction":0.4}],
+       "displayName":"Gemini 4 Argon","description":"Models within this group: Gemini 4 Argon"},
+      {"buckets":[
+        {"bucketId":"gemini-weekly","window":"weekly","resetTime":"2026-10-01T01:34:20Z","remainingFraction":0.85421365},
+        {"bucketId":"gemini-5h","window":"5h","resetTime":"2026-09-28T22:38:36Z","remainingFraction":0.9916939}],
+       "displayName":"Gemini Models","description":"Models within this group: Gemini Flash, Gemini Pro"},
+      {"buckets":[
+        {"bucketId":"3p-weekly","window":"weekly","resetTime":"2026-10-05T21:18:22Z","remainingFraction":1}],
+       "displayName":"Claude and GPT models"}]}
+    """;
+
+    [Fact]
+    public void Antigravity_argon_group_is_its_own_pool_even_when_listed_first()
+    {
+        var s = AntigravityProvider.Parse(AntigravityArgonGroupJson, Now);
+        var argon = s.Windows.Single(w => w.Group == "Argon");
+        Assert.Equal(WindowKind.Weekly, argon.Kind);
+        Assert.Equal(60, argon.UsedPercent, 1);
+        Assert.Equal(14.6, s.Get(WindowKind.Weekly)!.UsedPercent, 1);
+        Assert.Null(s.Get(WindowKind.Weekly)!.Group);
+        Assert.Null(s.Binding!.Group);
+        Assert.Equal(14.6, s.Binding.UsedPercent, 1);
+    }
+
+    [Fact]
+    public void Antigravity_argon_buckets_inside_the_gemini_group_split_out()
+    {
+        const string json = """
+        {"groups":[
+          {"buckets":[
+            {"bucketId":"gemini-weekly","window":"weekly","resetTime":"2026-10-01T01:34:20Z","remainingFraction":0.9},
+            {"bucketId":"gemini-5h","window":"5h","resetTime":"2026-09-28T22:38:36Z","remainingFraction":0.95},
+            {"bucketId":"gemini-argon-weekly","window":"weekly","resetTime":"2026-10-03T09:00:00Z","remainingFraction":0.1},
+            {"bucketId":"gemini-argon-5h","window":"5h","resetTime":"2026-09-28T23:00:00Z","remainingFraction":0.5}],
+           "displayName":"Gemini Models","description":"Models within this group: Gemini Flash, Gemini Pro, Gemini 4 Argon"}]}
+        """;
+        var s = AntigravityProvider.Parse(json, Now);
+        Assert.Equal(10, s.Get(WindowKind.Weekly)!.UsedPercent, 1);
+        Assert.Equal(5, s.Get(WindowKind.Session)!.UsedPercent, 1);
+        Assert.Equal(90, s.Windows.Single(w => w.Group == "Argon" && w.Kind == WindowKind.Weekly).UsedPercent, 1);
+        Assert.Equal(50, s.Windows.Single(w => w.Group == "Argon" && w.Kind == WindowKind.Session).UsedPercent, 1);
+        Assert.Null(s.Binding!.Group);
+    }
+
+    [Fact]
+    public void Antigravity_window_falls_back_to_the_bucket_id()
+    {
+        var s = AntigravityProvider.Parse("""
+        {"groups":[{"displayName":"Gemini 4 Argon","buckets":[
+          {"bucketId":"argon-weekly","resetTime":"2026-10-03T09:00:00Z","remainingFraction":0.75}]}]}
+        """, Now);
+        Assert.Equal(SnapshotStatus.Ok, s.Status);
+        var w = s.Windows.Single();
+        Assert.Equal((WindowKind.Weekly, "Argon"), (w.Kind, w.Group));
+        Assert.Equal(25, w.UsedPercent, 1);
+    }
+
     [Fact]
     public void Antigravity_without_buckets_is_an_error()
     {

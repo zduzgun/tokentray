@@ -83,7 +83,10 @@ public sealed class AntigravityProvider(Func<string?>? readCredential = null) : 
 
     /// <summary>
     /// Groups share a five-hour and a weekly limit. The Gemini group is the main allowance;
-    /// others (Claude and GPT models) become secondary pools.
+    /// others (Claude and GPT models) become secondary pools. Gemini 4 Argon has its own quota
+    /// (weekly only on AI Pro, weekly and five-hour on Ultra) that never counts against the main
+    /// allowance, so it is always its own "Argon" pool, whether it comes as a group or as buckets
+    /// inside the Gemini group.
     /// </summary>
     public static ProviderSnapshot Parse(string json, DateTimeOffset now)
     {
@@ -92,22 +95,26 @@ public sealed class AntigravityProvider(Func<string?>? readCredential = null) : 
         if (doc.RootElement.TryGetProperty("groups", out var groups) && groups.ValueKind == JsonValueKind.Array)
         {
             var list = groups.EnumerateArray().ToList();
-            var main = list.FindIndex(IsGemini);
+            var main = list.FindIndex(g => IsGemini(g) && !IsArgonGroup(g));
+            if (main < 0) main = list.FindIndex(g => !IsArgonGroup(g));
             if (main < 0) main = 0;
             for (var i = 0; i < list.Count; i++)
             {
                 var g = list[i];
-                string? group = i == main ? null : ShortGroup(Http.Str(g, "displayName") ?? $"Group {i + 1}");
+                string? group = IsArgonGroup(g) ? ArgonPool
+                    : i == main ? null
+                    : ShortGroup(Http.Str(g, "displayName") ?? $"Group {i + 1}");
                 if (!g.TryGetProperty("buckets", out var buckets) || buckets.ValueKind != JsonValueKind.Array) continue;
                 foreach (var b in buckets.EnumerateArray())
                 {
                     if (Http.Number(b, "remainingFraction") is not { } rem) continue;
                     var used = Math.Clamp((1 - Math.Clamp(rem, 0, 1)) * 100, 0, 100);
                     var reset = Http.Time(b, "resetTime");
-                    switch (Http.Str(b, "window")?.ToLowerInvariant())
+                    var pool = IsArgonBucket(b) ? ArgonPool : group;
+                    switch (WindowOf(b))
                     {
-                        case "5h": windows.Add(new UsageWindow(WindowKind.Session, "5-hour", used, reset, TimeSpan.FromHours(5), group)); break;
-                        case "weekly": windows.Add(new UsageWindow(WindowKind.Weekly, "Weekly", used, reset, TimeSpan.FromDays(7), group)); break;
+                        case WindowKind.Session: windows.Add(new UsageWindow(WindowKind.Session, "5-hour", used, reset, TimeSpan.FromHours(5), pool)); break;
+                        case WindowKind.Weekly: windows.Add(new UsageWindow(WindowKind.Weekly, "Weekly", used, reset, TimeSpan.FromDays(7), pool)); break;
                     }
                 }
             }
@@ -117,9 +124,37 @@ public sealed class AntigravityProvider(Func<string?>? readCredential = null) : 
             : new ProviderSnapshot(ProviderId.Antigravity, SnapshotStatus.Ok, windows, now);
     }
 
+    const string ArgonPool = "Argon";
+
+    /// <summary>"5h" or "weekly"; the bucket id ("gemini-5h", "argon-weekly") when the window field is missing.</summary>
+    static WindowKind? WindowOf(JsonElement b)
+    {
+        var w = (Http.Str(b, "window") ?? "").ToLowerInvariant().Replace("_", "").Replace("-", "");
+        if (w is "5h" or "5hour" or "fivehour") return WindowKind.Session;
+        if (w is "weekly" or "week" or "7d") return WindowKind.Weekly;
+        if (w.Length > 0) return null;
+        var id = (Http.Str(b, "bucketId") ?? "").ToLowerInvariant();
+        return id.EndsWith("5h") ? WindowKind.Session : id.EndsWith("weekly") ? WindowKind.Weekly : null;
+    }
+
     static bool IsGemini(JsonElement g) =>
         (Http.Str(g, "displayName") ?? "").Contains("gemini", StringComparison.OrdinalIgnoreCase) ||
         (Http.Str(g, "description") ?? "").Contains("gemini", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>A group that holds only Argon: named for it, or every bucket is an Argon bucket.</summary>
+    static bool IsArgonGroup(JsonElement g)
+    {
+        if (Mentions(g, "displayName", "argon")) return true;
+        if (!g.TryGetProperty("buckets", out var buckets) || buckets.ValueKind != JsonValueKind.Array) return false;
+        var list = buckets.EnumerateArray().ToList();
+        return list.Count > 0 && list.All(IsArgonBucket);
+    }
+
+    static bool IsArgonBucket(JsonElement b) =>
+        Mentions(b, "bucketId", "argon") || Mentions(b, "displayName", "argon");
+
+    static bool Mentions(JsonElement e, string prop, string word) =>
+        (Http.Str(e, prop) ?? "").Contains(word, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>"Claude and GPT models" → "Claude and GPT".</summary>
     static string ShortGroup(string name) =>
