@@ -17,11 +17,19 @@ public static class ClaudeDesktop
 
     public sealed record Token(string AccessToken, DateTimeOffset? ExpiresAt, string? AccountId, string? Plan = null);
 
-    /// <summary>Regular install first, then Microsoft Store packages.</summary>
+    /// <summary>Regular install first, then migrated Claude-Data folders, then Microsoft Store packages.</summary>
     public static IEnumerable<string> ConfigPaths()
     {
         yield return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude", "config.json");
-        var packages = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Packages");
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var claudeData = Path.Combine(localAppData, "Claude-Data");
+        if (Directory.Exists(claudeData))
+        {
+            yield return Path.Combine(claudeData, "config.json");
+            foreach (var dir in Directory.EnumerateDirectories(claudeData, "claude_*").OrderBy(d => !d.EndsWith("claude_pzs8sxrjxfjjc", StringComparison.OrdinalIgnoreCase)).ThenBy(d => d))
+                yield return Path.Combine(dir, "config.json");
+        }
+        var packages = Path.Combine(localAppData, "Packages");
         if (!Directory.Exists(packages)) yield break;
         foreach (var dir in Directory.EnumerateDirectories(packages, "Claude_*").OrderBy(d => !d.EndsWith("Claude_pzs8sxrjxfjjc")).ThenBy(d => d))
             yield return Path.Combine(dir, "LocalCache", "Roaming", "Claude", "config.json");

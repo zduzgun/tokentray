@@ -50,6 +50,27 @@ internal partial class FlyoutWindow : Window
     {
         base.OnSourceInitialized(e);
         ApplyTheme();
+        if (PresentationSource.FromVisual(this) is HwndSource src)
+            src.AddHook(WndProc);
+    }
+
+    IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg is WM_DPICHANGED or WM_SETTINGCHANGE && IsVisible)
+            Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, () => { if (IsVisible) Place(anchor); });
+        return IntPtr.Zero;
+    }
+
+    double Scale
+    {
+        get
+        {
+            var hwnd = new WindowInteropHelper(this).Handle;
+            if (hwnd != IntPtr.Zero && GetDpiForWindow(hwnd) is > 0 and var dpi) return dpi / 96.0;
+            var tb = FindWindow("Shell_TrayWnd", null);
+            if (tb != IntPtr.Zero && GetDpiForWindow(tb) is > 0 and var tbDpi) return tbDpi / 96.0;
+            return PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
+        }
     }
 
     void ApplyTheme()
@@ -111,6 +132,7 @@ internal partial class FlyoutWindow : Window
         Activate();
         Focus();
         PlayOpen();
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, () => { if (IsVisible) Place(this.anchor); });
     }
 
     /// <summary>The usage page as an image, on a solid surface, for README screenshots.</summary>
@@ -135,23 +157,68 @@ internal partial class FlyoutWindow : Window
         ShowSettings();
     }
 
+    public void Reposition(RECT? newAnchor = null)
+    {
+        if (newAnchor != null) anchor = newAnchor;
+        if (IsVisible) Place(anchor);
+    }
+
+    bool placing;
+
     void Place(RECT? anchor)
     {
-        var src = PresentationSource.FromVisual(this);
-        var scale = src?.CompositionTarget?.TransformToDevice.M11 ?? 1;
-        var work = SystemParameters.WorkArea;
-        const double margin = 12;
-        // Short screens scroll the page instead of pushing the flyout off-screen.
-        Scroller.MaxHeight = Math.Max(240, work.Height - margin * 2 - Footer.ActualHeight - 2);
-        var left = work.Right - ActualWidth - margin;
-        if (anchor is { } a)
+        if (placing) return;
+        placing = true;
+        try
         {
-            var center = (a.Left + a.Right) / 2.0 / scale;
-            left = Math.Clamp(center - ActualWidth / 2, work.Left + margin, work.Right - ActualWidth - margin);
+            var hwnd = new WindowInteropHelper(this).Handle;
+            var scale = Scale;
+            var (workPx, monPx) = WorkAreaPx(anchor, hwnd);
+            const double margin = 12;
+            var workHeightDip = workPx.Height / scale;
+
+            if (SizeToContent != SizeToContent.Height) SizeToContent = SizeToContent.Height;
+
+            // Short screens scroll the page instead of pushing the flyout off-screen.
+            var footerH = Footer.ActualHeight > 0 ? Footer.ActualHeight : 46;
+            var maxScroller = Math.Max(240, workHeightDip - margin * 2 - footerH - 2);
+            if (Math.Abs(Scroller.MaxHeight - maxScroller) > 0.5)
+                Scroller.MaxHeight = maxScroller;
+
+            UpdateLayout();
+            Frame.Measure(new Size(Width, Math.Max(240, workHeightDip - margin * 2)));
+            var widthDip = Width > 0 ? Width : ActualWidth;
+            var desiredHeightDip = Frame.DesiredSize.Height > 0 ? Frame.DesiredSize.Height : ActualHeight;
+            var heightDip = Math.Min(desiredHeightDip, Math.Max(240, workHeightDip - margin * 2));
+
+            var marginPx = (int)Math.Round(margin * scale);
+            var widthPx = (int)Math.Round(widthDip * scale);
+            var heightPx = (int)Math.Round(heightDip * scale);
+
+            var leftPx = workPx.Right - widthPx - marginPx;
+            if (anchor is { Width: > 0 } a)
+            {
+                var centerPx = (a.Left + a.Right) / 2;
+                leftPx = Math.Clamp(centerPx - widthPx / 2, workPx.Left + marginPx, Math.Max(workPx.Left + marginPx, workPx.Right - widthPx - marginPx));
+            }
+
+            // Taskbar on top: open downward, otherwise above the taskbar / work area bottom.
+            var taskbarOnTop = workPx.Top > monPx.Top && (anchor is null || anchor.Value.Top < workPx.Top);
+            var topPx = taskbarOnTop ? workPx.Top + marginPx : workPx.Bottom - heightPx - marginPx;
+            topPx = Math.Clamp(topPx, workPx.Top + marginPx, Math.Max(workPx.Top + marginPx, workPx.Bottom - heightPx - marginPx));
+
+            Left = leftPx / scale;
+            Top = topPx / scale;
+            if (hwnd != IntPtr.Zero)
+            {
+                SetWindowPos(hwnd, IntPtr.Zero, leftPx, topPx, widthPx, heightPx, SWP_NOZORDER | SWP_NOACTIVATE);
+                if (SizeToContent != SizeToContent.Height) SizeToContent = SizeToContent.Height;
+            }
         }
-        Left = left;
-        // Taskbar on top: open downward, otherwise above.
-        Top = work.Top > 0 && (anchor?.Top ?? 1) / scale < work.Top ? work.Top + margin : work.Bottom - ActualHeight - margin;
+        finally
+        {
+            placing = false;
+        }
     }
 
     void PlayOpen()
@@ -176,6 +243,7 @@ internal partial class FlyoutWindow : Window
         if (!settingsPage) Build(animateBars: false);
         // Style previews use live data; skip while the offset slider is being dragged.
         else if (!generalTab && Mouse.LeftButton != MouseButtonState.Pressed) ShowSettings();
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, () => { if (IsVisible) Place(anchor); });
     }
 
     void OnRefresh(object sender, RoutedEventArgs e)
@@ -193,7 +261,12 @@ internal partial class FlyoutWindow : Window
         if (settingsPage) ShowUsage(); else ShowSettings();
     }
 
-    void ShowUsage() { settingsPage = false; Build(animateBars: true); }
+    void ShowUsage()
+    {
+        settingsPage = false;
+        Build(animateBars: true);
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, () => { if (IsVisible) Place(anchor); });
+    }
 
     // ───────────── Usage page ─────────────
 
@@ -215,7 +288,8 @@ internal partial class FlyoutWindow : Window
         }
 
         // Three or more tools side by side in two balanced columns, when the screen has room.
-        var twoColumns = snaps.Count >= 3 && SystemParameters.WorkArea.Width >= 820;
+        var workWidthDip = WorkAreaPx(anchor, new WindowInteropHelper(this).Handle).work.Width / Scale;
+        var twoColumns = snaps.Count >= 3 && workWidthDip >= 820;
         Width = twoColumns ? 720 : 360;
         if (twoColumns)
         {
@@ -408,6 +482,7 @@ internal partial class FlyoutWindow : Window
         Page.Children.Add(tabs);
 
         if (generalTab) GeneralSettings(); else TaskbarSettings();
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, () => { if (IsVisible) Place(anchor); });
     }
 
     void TaskbarSettings()

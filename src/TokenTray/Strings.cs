@@ -141,6 +141,7 @@ internal static class S
 
     // Menu and settings
     public static string Refresh => T("Refresh now", "Şimdi yenile");
+    public static string ResetView => T("Reset view", "Görünümü sıfırla");
     public static string Settings => T("Settings", "Ayarlar");
     public static string Quit => T("Quit TokenTray", "TokenTray'den çık");
     public static string DisplayLabel => T("Numbers show", "Sayılar neyi göstersin");

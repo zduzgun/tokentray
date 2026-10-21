@@ -56,6 +56,21 @@ internal sealed class TaskbarWidget : IDisposable
         if (hwnd != IntPtr.Zero) ShowWindow(hwnd, SW_HIDE);
     }
 
+    public void Reset()
+    {
+        if (hwnd != IntPtr.Zero && IsWindow(hwnd)) DestroyWindow(hwnd);
+        hwnd = IntPtr.Zero;
+        embedded = false;
+        hover = false;
+        lastTaskbar = default;
+        lastTray = default;
+        if (visible && source != null)
+        {
+            EnsureWindow();
+            Redraw();
+        }
+    }
+
     void EnsureWindow()
     {
         if (hwnd != IntPtr.Zero && IsWindow(hwnd)) return;

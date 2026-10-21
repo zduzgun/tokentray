@@ -127,12 +127,12 @@ public sealed class ClaudeProvider(string? configDir = null, string? key = null,
     {
         var dir = configDir ?? DefaultConfigDir();
         LastAccount = null;
-        var (uuid, email) = await AccountOf(dir, ct);
+        var (uuid, email, cliPlan) = await AccountOf(dir, ct);
         var account = uuid ?? email;
         LastAccount = account;
 
         // Candidate 1: the CLI's credentials file.
-        string? token = null; DateTimeOffset? expires = null; string? plan = null; var cliFound = false;
+        string? token = null; DateTimeOffset? expires = null; string? plan = cliPlan; var cliFound = false;
         var path = Path.Combine(dir, ".credentials.json");
         if (File.Exists(path))
         {
@@ -142,7 +142,7 @@ public sealed class ClaudeProvider(string? configDir = null, string? key = null,
                 var o = doc.RootElement.GetProperty("claudeAiOauth");
                 token = o.GetProperty("accessToken").GetString();
                 expires = o.TryGetProperty("expiresAt", out var e) && e.ValueKind == JsonValueKind.Number ? DateTimeOffset.FromUnixTimeMilliseconds(e.GetInt64()) : null;
-                plan = PlanName(Http.Str(o, "subscriptionType"), Http.Str(o, "rateLimitTier"));
+                plan = PlanName(Http.Str(o, "subscriptionType"), Http.Str(o, "rateLimitTier")) ?? cliPlan;
                 cliFound = token != null;
             }
             catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException) { }
@@ -160,7 +160,13 @@ public sealed class ClaudeProvider(string? configDir = null, string? key = null,
         void Use(ClaudeDesktop.Token d)
         {
             token = d.AccessToken; expires = d.ExpiresAt;
-            if (!cliFound) { plan = d.Plan; account = d.AccountId; email = null; }
+            if (!cliFound)
+            {
+                var sameAccount = uuid != null && string.Equals(d.AccountId, uuid, StringComparison.OrdinalIgnoreCase);
+                plan = d.Plan ?? (sameAccount ? cliPlan : null);
+                account = d.AccountId;
+                if (!sameAccount) email = null;
+            }
             else plan ??= d.Plan;
             LastAccount = account;
         }
@@ -201,8 +207,8 @@ public sealed class ClaudeProvider(string? configDir = null, string? key = null,
         return await Http.Send(req, ct);
     }
 
-    /// <summary>The signed-in account (uuid, email), from the CLI's global config beside the credentials.</summary>
-    static async Task<(string? uuid, string? email)> AccountOf(string configDir, CancellationToken ct)
+    /// <summary>The signed-in account (uuid, email, plan), from the CLI's global config beside the credentials.</summary>
+    static async Task<(string? uuid, string? email, string? plan)> AccountOf(string configDir, CancellationToken ct)
     {
         // Default layout keeps ~/.claude.json next to ~/.claude; a custom CLAUDE_CONFIG_DIR keeps it inside.
         var candidates = new[] { Path.Combine(configDir, ".claude.json"), Path.Combine(Path.GetDirectoryName(configDir.TrimEnd('\\', '/')) ?? configDir, ".claude.json") };
@@ -212,11 +218,15 @@ public sealed class ClaudeProvider(string? configDir = null, string? key = null,
             {
                 using var doc = JsonDocument.Parse(await Http.ReadShared(file, ct));
                 if (doc.RootElement.TryGetProperty("oauthAccount", out var a))
-                    return (Http.Str(a, "accountUuid"), Http.Str(a, "emailAddress"));
+                {
+                    var tier = Http.Str(a, "userRateLimitTier") ?? Http.Str(a, "organizationRateLimitTier");
+                    var plan = PlanName(Http.Str(a, "seatTier"), tier);
+                    return (Http.Str(a, "accountUuid"), Http.Str(a, "emailAddress"), plan);
+                }
             }
             catch (Exception ex) when (ex is JsonException or IOException) { }
         }
-        return (null, null);
+        return (null, null, null);
     }
 
     public static ProviderSnapshot Parse(string json, DateTimeOffset now)

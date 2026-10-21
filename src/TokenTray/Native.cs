@@ -41,6 +41,17 @@ internal static partial class Native
     [StructLayout(LayoutKind.Sequential)]
     public struct APPBARDATA { public int cbSize; public IntPtr hWnd; public uint uCallbackMessage, uEdge; public RECT rc; public IntPtr lParam; }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct MONITORINFO
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+
+    public const uint MONITOR_DEFAULTTOPRIMARY = 1, MONITOR_DEFAULTTONEAREST = 2;
+
     [DllImport("user32", CharSet = CharSet.Unicode, SetLastError = true)] public static extern ushort RegisterClassEx(ref WNDCLASSEX wc);
     [DllImport("user32", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr CreateWindowEx(int exStyle, string className, string title, int style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr param);
@@ -68,6 +79,8 @@ internal static partial class Native
     [DllImport("user32", CharSet = CharSet.Unicode)] public static extern uint RegisterWindowMessage(string name);
     [DllImport("user32")] public static extern IntPtr LoadCursor(IntPtr inst, IntPtr id);
     [DllImport("user32")] public static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint flags);
+    [DllImport("user32")] public static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
+    [DllImport("user32", CharSet = CharSet.Unicode)] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
     [DllImport("user32")] public static extern bool SystemParametersInfo(uint action, uint param, out bool value, uint winIni);
     [DllImport("user32")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32")] public static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -92,4 +105,46 @@ internal static partial class Native
 
     public static bool IsWindows11 => Environment.OSVersion.Version.Build >= 22000;
     public static bool SupportsBackdrop => Environment.OSVersion.Version.Build >= 22621;
+
+    /// <summary>
+    /// Physical-pixel work area and full bounds of the monitor containing <paramref name="anchor"/>
+    /// (or the cursor/taskbar when no anchor is given), clamped against the taskbar edge so DPI or
+    /// resolution changes never let a popup slip behind or below the taskbar.
+    /// </summary>
+    public static (RECT work, RECT monitor) WorkAreaPx(RECT? anchor, IntPtr fallbackHwnd = default)
+    {
+        IntPtr hMon = IntPtr.Zero;
+        if (anchor is { Width: > 0, Height: > 0 } a)
+            hMon = MonitorFromPoint(new POINT { X = (a.Left + a.Right) / 2, Y = (a.Top + a.Bottom) / 2 }, MONITOR_DEFAULTTONEAREST);
+        if (hMon == IntPtr.Zero && GetCursorPos(out var pt))
+            hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        var tb = FindWindow("Shell_TrayWnd", null);
+        if (hMon == IntPtr.Zero && tb != IntPtr.Zero)
+            hMon = MonitorFromWindow(tb, MONITOR_DEFAULTTONEAREST);
+        if (hMon == IntPtr.Zero)
+            hMon = MonitorFromWindow(fallbackHwnd, MONITOR_DEFAULTTOPRIMARY);
+
+        var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (hMon != IntPtr.Zero && GetMonitorInfo(hMon, ref mi))
+        {
+            var work = mi.rcWork;
+            var mon = mi.rcMonitor;
+            var midY = mon.Top + mon.Height / 2;
+            if (tb != IntPtr.Zero && MonitorFromWindow(tb, MONITOR_DEFAULTTONEAREST) == hMon && GetWindowRect(tb, out var tbr) && tbr.Width >= tbr.Height * 2)
+            {
+                if (tbr.Top >= midY) work.Bottom = Math.Min(work.Bottom, tbr.Top);
+                else if (tbr.Bottom <= midY) work.Top = Math.Max(work.Top, tbr.Bottom);
+            }
+            if (anchor is { Width: > 0, Height: > 0 } anc)
+            {
+                if (anc.Top >= midY) work.Bottom = Math.Min(work.Bottom, anc.Top);
+                else if (anc.Bottom <= midY) work.Top = Math.Max(work.Top, anc.Bottom);
+            }
+            return (work, mon);
+        }
+
+        var wa = System.Windows.SystemParameters.WorkArea;
+        var fallback = new RECT { Left = (int)wa.Left, Top = (int)wa.Top, Right = (int)wa.Right, Bottom = (int)wa.Bottom };
+        return (fallback, fallback);
+    }
 }

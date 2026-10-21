@@ -83,7 +83,7 @@ public partial class App : Application
         tick.Start();
 
         SystemEvents.UserPreferenceChanged += (_, _) => Dispatcher.BeginInvoke(Render);
-        SystemEvents.DisplaySettingsChanged += (_, _) => Dispatcher.BeginInvoke(() => widget?.Redraw());
+        SystemEvents.DisplaySettingsChanged += (_, _) => Dispatcher.BeginInvoke(() => { widget?.Redraw(); flyout?.Reposition(widget?.ScreenBounds); });
         SystemEvents.PowerModeChanged += (_, pe) => { if (pe.Mode == PowerModes.Resume) poller?.RefreshNow(); };
 
         if (e.Args.Contains("--open")) Dispatcher.BeginInvoke(() => flyout.ShowAt(widget.ScreenBounds), DispatcherPriority.ApplicationIdle);
@@ -232,6 +232,7 @@ public partial class App : Application
             menu.Items.Add(mi);
         }
         Add(S.Refresh, () => poller?.RefreshNow());
+        Add(S.ResetView, ResetView);
         Add(S.Settings, () => flyout?.ShowSettingsAt(widget?.ScreenBounds));
         menu.Items.Add(new Separator { Style = (Style)Resources["TrayMenuSeparator"] });
         Add(S.Quit, Quit);
@@ -240,6 +241,18 @@ public partial class App : Application
         // loses mouse capture and closes at once. Bring a window of ours forward first.
         Native.SetForegroundWindow(MenuOwner());
         menu.IsOpen = true;
+    }
+
+    void ResetView()
+    {
+        hoverDelay?.Stop();
+        card?.Close();
+        card = new HoverCard();
+        flyout?.Close();
+        flyout = new FlyoutWindow(Snapshots, WidgetRows, settings, OnSettingsChanged, () => poller?.RefreshNow(), Quit);
+        widget?.Reset();
+        ApplyWidget();
+        Render();
     }
 
     /// <summary>A never-shown window that owns the foreground while the tray menu is open.</summary>

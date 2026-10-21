@@ -64,12 +64,24 @@ internal sealed class HoverCard : Window
         Opacity = 0;
         Show();
         UpdateLayout();
-        var scale = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice.M11 ?? 1;
-        var work = SystemParameters.WorkArea;
-        Left = Math.Clamp((anchor.Left + anchor.Right) / 2.0 / scale - ActualWidth / 2, work.Left, work.Right - ActualWidth);
+        var hwnd = new WindowInteropHelper(this).Handle;
+        var scale = hwnd != IntPtr.Zero && GetDpiForWindow(hwnd) is > 0 and var dpi ? dpi / 96.0
+            : PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice.M11 ?? 1;
+        var (workPx, _) = WorkAreaPx(anchor, hwnd);
+        frame.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+        var widthDip = Math.Max(ActualWidth, frame.DesiredSize.Width);
+        var heightDip = Math.Max(ActualHeight, frame.DesiredSize.Height);
+        var widthPx = (int)Math.Round(widthDip * scale);
+        var heightPx = (int)Math.Round(heightDip * scale);
+        var padPx = (int)Math.Round(6 * scale);
+        var leftPx = Math.Clamp((anchor.Left + anchor.Right) / 2 - widthPx / 2, workPx.Left, Math.Max(workPx.Left, workPx.Right - widthPx));
         // Above the widget, or below it when the taskbar sits at the top of the screen.
-        var above = anchor.Top / scale - ActualHeight + 6;
-        Top = above >= work.Top ? above : Math.Min(anchor.Bottom / scale - 6, work.Bottom - ActualHeight);
+        var abovePx = anchor.Top - heightPx + padPx;
+        var topPx = abovePx >= workPx.Top ? abovePx : Math.Min(anchor.Bottom - padPx, workPx.Bottom - heightPx);
+        Left = leftPx / scale;
+        Top = topPx / scale;
+        if (hwnd != IntPtr.Zero)
+            SetWindowPos(hwnd, IntPtr.Zero, leftPx, topPx, widthPx, heightPx, SWP_NOZORDER | SWP_NOACTIVATE);
         if (AnimationsEnabled) BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(120)));
         else Opacity = 1;
     }
