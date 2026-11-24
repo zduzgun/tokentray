@@ -7,16 +7,26 @@ using System.Text.Json;
 namespace TokenTray.Core;
 
 /// <summary>
-/// Google Antigravity. The IDE keeps its Google sign-in in Windows Credential Manager
-/// ("gemini:antigravity") and refreshes it while it runs. We only read it: an expired
-/// token means "open Antigravity", never a refresh from here.
+/// Google Antigravity. The app and CLI keep their Google sign-in in Windows Credential Manager
+/// ("gemini:antigravity"). Newer desktop builds (2.34+) keep refreshed access tokens in memory
+/// rather than rewriting the credential every hour; when the stored token has expired, TokenTray
+/// asks the official `agy` CLI (`agy models`, if installed) to refresh its own sign-in and then
+/// re-reads it read-only. TokenTray itself never calls OAuth or writes credentials.
 /// </summary>
 public sealed class AntigravityProvider(
     Func<string?>? readCredential = null,
-    Func<CancellationToken, Task<AntigravityLocal.Answer?>>? askLocal = null) : IUsageProvider
+    Func<CancellationToken, Task<AntigravityLocal.Answer?>>? askLocal = null,
+    Func<CancellationToken, Task<bool>>? refreshViaCli = null,
+    Func<DateTimeOffset>? utcNow = null,
+    Func<string, string, string, CancellationToken, Task<(Http.Outcome, int, string)>>? post = null) : IUsageProvider
 {
     const string Target = "gemini:antigravity";
     static readonly string[] Endpoints = ["https://daily-cloudcode-pa.googleapis.com", "https://cloudcode-pa.googleapis.com"];
+    static readonly TimeSpan CliRefreshCooldown = TimeSpan.FromMinutes(5);
+    static readonly Lazy<string> ClientVersion = new(DetectClientVersion);
+
+    DateTimeOffset lastCliRefresh = DateTimeOffset.MinValue;
+
     public ProviderId Id => ProviderId.Antigravity;
     public string? LastAccount { get; private set; }
 
@@ -25,24 +35,16 @@ public sealed class AntigravityProvider(
     public async Task<ProviderSnapshot> FetchAsync(CancellationToken ct)
     {
         LastAccount = null;
-        var raw = (readCredential ?? (() => CredentialStore.Read(Target)))();
+        var read = readCredential ?? (() => CredentialStore.Read(Target));
+        var now = (utcNow ?? (() => DateTimeOffset.UtcNow))();
+
+        var raw = read();
         if (raw is null)
             return ProviderSnapshot.Failed(Id, SnapshotStatus.NotSignedIn, "No Antigravity sign-in found. Open Antigravity and sign in with Google.");
 
-        string token; DateTimeOffset? expiry; string? account;
-        try
-        {
-            using var doc = JsonDocument.Parse(raw);
-            var t = doc.RootElement.GetProperty("token");
-            token = Http.Str(t, "access_token") ?? "";
-            expiry = Http.Time(t, "expiry");
-            account = Jwt.Claim(Http.Str(doc.RootElement, "id_token"), "email");
-            LastAccount = account;
-        }
-        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
-        {
+        if (!TryParseCredential(raw, out var token, out var expiry, out var account))
             return ProviderSnapshot.Failed(Id, SnapshotStatus.NotSignedIn, "Antigravity's stored sign-in is unreadable. Sign in again in Antigravity.");
-        }
+        LastAccount = account;
 
         // The Antigravity app, while it runs, answers with exactly what its own usage panel shows,
         // including pools the cloud endpoints leave out for other clients (Gemini 4 Argon).
@@ -58,38 +60,136 @@ public sealed class AntigravityProvider(
             }
         }
 
-        if (token.Length == 0 || expiry is { } e && e <= DateTimeOffset.UtcNow.AddSeconds(60))
-            return ProviderSnapshot.Failed(Id, SnapshotStatus.TokenExpired, "Antigravity's sign-in has expired. Open Antigravity once and it will refresh.") with { Account = account };
+        var refreshedViaCli = false;
+        if (IsExpired(token, expiry, now))
+        {
+            (refreshedViaCli, token, expiry, account) = await TryRefreshCredentialAsync(read, now, ct, token, expiry, account);
+            if (IsExpired(token, expiry, now))
+                return ProviderSnapshot.Failed(Id, SnapshotStatus.TokenExpired, "Antigravity's sign-in has expired. Open Antigravity once and it will refresh.")
+                    with { Account = account, Email = account };
+        }
 
+        var (cloudSnap, auth, lastError) = await FetchCloudAsync(token, account, ct);
+        if (cloudSnap is not null) return cloudSnap;
+
+        if (auth && !refreshedViaCli)
+        {
+            var oldToken = token;
+            var retry = await TryRefreshCredentialAsync(read, now, ct, token, expiry, account);
+            if (retry.Refreshed && !IsExpired(retry.Token, retry.Expiry, now) && retry.Token != oldToken)
+            {
+                (token, expiry, account) = (retry.Token, retry.Expiry, retry.Account);
+                (cloudSnap, auth, lastError) = await FetchCloudAsync(token, account, ct);
+                if (cloudSnap is not null) return cloudSnap;
+            }
+        }
+
+        return auth
+            ? ProviderSnapshot.Failed(Id, SnapshotStatus.TokenExpired, "Antigravity rejected the sign-in. Open Antigravity once to refresh it.") with { Account = account, Email = account }
+            : ProviderSnapshot.Failed(Id, SnapshotStatus.Error, lastError) with { Account = account, Email = account };
+    }
+
+    async Task<(bool Refreshed, string Token, DateTimeOffset? Expiry, string? Account)> TryRefreshCredentialAsync(
+        Func<string?> read, DateTimeOffset now, CancellationToken ct,
+        string token, DateTimeOffset? expiry, string? account)
+    {
+        if (now - lastCliRefresh < CliRefreshCooldown) return (false, token, expiry, account);
+        lastCliRefresh = now;
+        if (!await (refreshViaCli ?? AntigravityCli.TryRefreshAsync)(ct)) return (false, token, expiry, account);
+        var updated = read();
+        if (updated is null || !TryParseCredential(updated, out var newToken, out var newExpiry, out var newAccount))
+            return (false, token, expiry, account);
+        var resolvedAccount = newAccount ?? account;
+        LastAccount = resolvedAccount;
+        return (true, newToken, newExpiry, resolvedAccount);
+    }
+
+    async Task<(ProviderSnapshot? Snap, bool Auth, string LastError)> FetchCloudAsync(string token, string? account, CancellationToken ct)
+    {
+        var send = post ?? Post;
         var auth = false; var lastError = "Antigravity quota service didn't answer.";
         ProviderSnapshot? partial = null;
         foreach (var baseUrl in Endpoints)
         {
-            var (o1, s1, load) = await Post(baseUrl + "/v1internal:loadCodeAssist", """{"metadata":{"ideType":"ANTIGRAVITY"}}""", token, ct);
+            var (o1, s1, load) = await send(baseUrl + "/v1internal:loadCodeAssist", """{"metadata":{"ideType":"ANTIGRAVITY"}}""", token, ct);
             if (o1 == Http.Outcome.Auth) { auth = true; continue; }
             if (o1 != Http.Outcome.Ok) { lastError = $"Antigravity returned {s1}."; continue; }
 
             string? project; string? plan;
             using (var doc = JsonDocument.Parse(load))
             {
-                project = Http.Str(doc.RootElement, "cloudaicompanionProject");
+                project = ProjectId(doc.RootElement);
                 plan = TierName(doc.RootElement, "paidTier") ?? TierName(doc.RootElement, "currentTier");
             }
             if (project is null) { lastError = "Antigravity has no quota project for this account."; continue; }
 
-            var (o2, s2, summary) = await Post(baseUrl + "/v1internal:retrieveUserQuotaSummary", JsonSerializer.Serialize(new { project }), token, ct);
+            var (o2, s2, summary) = await send(baseUrl + "/v1internal:retrieveUserQuotaSummary", JsonSerializer.Serialize(new { project }), token, ct);
             if (o2 == Http.Outcome.Auth) { auth = true; continue; }
             if (o2 != Http.Outcome.Ok) { lastError = $"Antigravity quota summary returned {s2}."; continue; }
             var snap = Parse(summary, DateTimeOffset.Now) with { Plan = plan, Account = account, Email = account };
             // An endpoint can answer without the Gemini group (daily-cloudcode-pa does for clients it
             // doesn't recognise); ask the next one before settling for the other pools alone.
-            if (snap.Status == SnapshotStatus.Ok && snap.Windows.Any(w => w.Group is null)) return snap;
+            if (snap.Status == SnapshotStatus.Ok && snap.Windows.Any(w => w.Group is null)) return (snap, false, lastError);
             if (snap.Status == SnapshotStatus.Ok) partial ??= snap;
         }
-        if (partial is not null) return partial;
-        return auth
-            ? ProviderSnapshot.Failed(Id, SnapshotStatus.TokenExpired, "Antigravity rejected the sign-in. Open Antigravity once to refresh it.") with { Account = account }
-            : ProviderSnapshot.Failed(Id, SnapshotStatus.Error, lastError) with { Account = account };
+        return (partial, auth, lastError);
+    }
+
+    static bool IsExpired(string token, DateTimeOffset? expiry, DateTimeOffset now) =>
+        token.Length == 0 || expiry is { } e && e <= now.AddSeconds(60);
+
+    static bool TryParseCredential(string raw, out string token, out DateTimeOffset? expiry, out string? account)
+    {
+        token = ""; expiry = null; account = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            var root = doc.RootElement;
+            var t = root.GetProperty("token");
+            token = Http.Str(t, "access_token") ?? "";
+            expiry = Http.Time(t, "expiry");
+            account = ReadAccount(root);
+            return true;
+        }
+        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Antigravity 2.34+ stores "id_token_email" directly; earlier builds stored a JWT "id_token".</summary>
+    static string? ReadAccount(JsonElement root)
+    {
+        var direct = Http.Str(root, "id_token_email")?.Trim();
+        return !string.IsNullOrEmpty(direct) ? direct : Jwt.Claim(Http.Str(root, "id_token"), "email");
+    }
+
+    /// <summary>"cloudaicompanionProject" is normally a string, occasionally {"id":"…"}.</summary>
+    internal static string? ProjectId(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("cloudaicompanionProject", out var p)) return null;
+        if (p.ValueKind == JsonValueKind.String) return p.GetString();
+        if (p.ValueKind == JsonValueKind.Object) return Http.Str(p, "id");
+        return null;
+    }
+
+    static string DetectClientVersion()
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                var exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "antigravity", "Antigravity.exe");
+                if (File.Exists(exe))
+                {
+                    var v = FileVersionInfo.GetVersionInfo(exe).FileVersion;
+                    var m = v is null ? null : System.Text.RegularExpressions.Regex.Match(v, @"\d+\.\d+\.\d+");
+                    if (m is { Success: true }) return m.Value;
+                }
+            }
+        }
+        catch { }
+        return "2.34.0";
     }
 
     static string? TierName(JsonElement root, string prop) =>
@@ -100,7 +200,7 @@ public sealed class AntigravityProvider(
         using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         // daily-cloudcode-pa gates the Gemini group on an IDE version and the Argon group on a current build cl.
-        req.Headers.UserAgent.ParseAdd("antigravity/2.24.0 (aidev_client; cl=999999999)");
+        req.Headers.UserAgent.ParseAdd($"antigravity/{ClientVersion.Value} (aidev_client; cl=999999999)");
         return await Http.Send(req, ct);
     }
 
@@ -323,6 +423,73 @@ public static class AntigravityLocal
         }
         finally { Marshal.FreeHGlobal(buf); }
         return ports;
+    }
+}
+
+/// <summary>
+/// Asks the official Antigravity CLI (`agy models`) to refresh its own stored credential when
+/// Windows Credential Manager still holds an expired access token. Read-only from TokenTray's
+/// side: TokenTray never touches refresh tokens or writes credentials.
+/// </summary>
+public static class AntigravityCli
+{
+    public static string? FindExecutable()
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        var local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "agy", "bin", "agy.exe");
+        if (File.Exists(local)) return local;
+        var pathEnv = Environment.GetEnvironmentVariable("PATH");
+        if (string.IsNullOrEmpty(pathEnv)) return null;
+        foreach (var rawDir in pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var dir = rawDir.Trim('"');
+            if (dir.Length == 0) continue;
+            try
+            {
+                var candidate = Path.Combine(dir, "agy.exe");
+                if (File.Exists(candidate)) return candidate;
+            }
+            catch (ArgumentException) { }
+        }
+        return null;
+    }
+
+    public static async Task<bool> TryRefreshAsync(CancellationToken ct)
+    {
+        var exe = FindExecutable();
+        if (exe is null) return false;
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo(exe, "models")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            });
+            if (p is null) return false;
+            try { p.StandardInput.Close(); } catch { }
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            var stdout = p.StandardOutput.ReadToEndAsync(timeout.Token);
+            var stderr = p.StandardError.ReadToEndAsync(timeout.Token);
+            try
+            {
+                await p.WaitForExitAsync(timeout.Token);
+                await Task.WhenAll(stdout, stderr);
+                return p.ExitCode == 0;
+            }
+            catch (OperationCanceledException)
+            {
+                try { p.Kill(entireProcessTree: true); } catch { }
+                return false;
+            }
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException or IOException)
+        {
+            return false;
+        }
     }
 }
 

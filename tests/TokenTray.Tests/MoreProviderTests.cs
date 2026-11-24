@@ -150,6 +150,119 @@ public class MoreProviderTests
         Assert.Single(s.Windows.Where(w => w.Group == "Argon"));
     }
 
+    static string FakeAntigravityV234Credential(string email, string token, DateTimeOffset expiry) =>
+        $$"""{"token":{"access_token":"{{token}}","expiry":"{{expiry:O}}"},"auth_method":"consumer","id_token_email":"{{email}}"}""";
+
+    [Fact]
+    public async Task Antigravity_reads_id_token_email_and_project_object()
+    {
+        var cred = FakeAntigravityV234Credential("user@example.com", "fresh-tok", Now.AddHours(1));
+        var p = new AntigravityProvider(
+            readCredential: () => cred,
+            askLocal: _ => Task.FromResult<AntigravityLocal.Answer?>(null),
+            refreshViaCli: _ => Task.FromResult(false),
+            utcNow: () => Now,
+            post: (url, _, _, _) => Task.FromResult(url.EndsWith("loadCodeAssist")
+                ? (Http.Outcome.Ok, 200, """{"cloudaicompanionProject":{"id":"proj-1"},"paidTier":{"name":"Google AI Pro"}}""")
+                : (Http.Outcome.Ok, 200, AntigravityJson)));
+
+        var s = await p.FetchAsync(CancellationToken.None);
+        Assert.Equal(SnapshotStatus.Ok, s.Status);
+        Assert.Equal("user@example.com", s.Account);
+        Assert.Equal("user@example.com", s.Email);
+        Assert.Equal("user@example.com", p.LastAccount);
+        Assert.Equal("Google AI Pro", s.Plan);
+        Assert.Equal(14.6, s.Get(WindowKind.Weekly)!.UsedPercent, 1);
+    }
+
+    [Fact]
+    public async Task Antigravity_refreshes_expired_credential_via_cli_and_fetches_cloud()
+    {
+        var cred = FakeAntigravityV234Credential("user@example.com", "old-tok", Now.AddMinutes(-10));
+        var cliCalls = 0;
+        var seenTokens = new List<string>();
+        var p = new AntigravityProvider(
+            readCredential: () => cred,
+            askLocal: _ => Task.FromResult<AntigravityLocal.Answer?>(null),
+            refreshViaCli: _ =>
+            {
+                cliCalls++;
+                cred = FakeAntigravityV234Credential("user@example.com", "new-tok", Now.AddHours(1));
+                return Task.FromResult(true);
+            },
+            utcNow: () => Now,
+            post: (url, _, tok, _) =>
+            {
+                seenTokens.Add(tok);
+                return Task.FromResult(url.EndsWith("loadCodeAssist")
+                    ? (Http.Outcome.Ok, 200, """{"cloudaicompanionProject":"proj-1","currentTier":{"name":"Antigravity"}}""")
+                    : (Http.Outcome.Ok, 200, AntigravityJson));
+            });
+
+        var s = await p.FetchAsync(CancellationToken.None);
+        Assert.Equal(SnapshotStatus.Ok, s.Status);
+        Assert.Equal(1, cliCalls);
+        Assert.All(seenTokens, t => Assert.Equal("new-tok", t));
+        Assert.Equal("user@example.com", s.Account);
+    }
+
+    [Fact]
+    public async Task Antigravity_retries_once_via_cli_when_cloud_rejects_token()
+    {
+        var cred = FakeAntigravityV234Credential("user@example.com", "revoked-tok", Now.AddHours(1));
+        var cliCalls = 0;
+        var p = new AntigravityProvider(
+            readCredential: () => cred,
+            askLocal: _ => Task.FromResult<AntigravityLocal.Answer?>(null),
+            refreshViaCli: _ =>
+            {
+                cliCalls++;
+                cred = FakeAntigravityV234Credential("user@example.com", "fresh-tok", Now.AddHours(1));
+                return Task.FromResult(true);
+            },
+            utcNow: () => Now,
+            post: (url, _, tok, _) =>
+            {
+                if (tok == "revoked-tok") return Task.FromResult((Http.Outcome.Auth, 401, "{}"));
+                return Task.FromResult(url.EndsWith("loadCodeAssist")
+                    ? (Http.Outcome.Ok, 200, """{"cloudaicompanionProject":"proj-1","paidTier":{"name":"Google AI Pro"}}""")
+                    : (Http.Outcome.Ok, 200, AntigravityJson));
+            });
+
+        var s = await p.FetchAsync(CancellationToken.None);
+        Assert.Equal(SnapshotStatus.Ok, s.Status);
+        Assert.Equal(1, cliCalls);
+        Assert.Equal("user@example.com", s.Account);
+    }
+
+    [Fact]
+    public async Task Antigravity_cli_refresh_respects_cooldown_and_keeps_account_on_expiry()
+    {
+        var clock = Now;
+        var cred = FakeAntigravityV234Credential("user@example.com", "old-tok", Now.AddMinutes(-10));
+        var cliCalls = 0;
+        var p = new AntigravityProvider(
+            readCredential: () => cred,
+            askLocal: _ => Task.FromResult<AntigravityLocal.Answer?>(null),
+            refreshViaCli: _ => { cliCalls++; return Task.FromResult(false); },
+            utcNow: () => clock);
+
+        var first = await p.FetchAsync(CancellationToken.None);
+        Assert.Equal(SnapshotStatus.TokenExpired, first.Status);
+        Assert.Equal("user@example.com", first.Account);
+        Assert.Equal(1, cliCalls);
+
+        clock = clock.AddMinutes(2);
+        var second = await p.FetchAsync(CancellationToken.None);
+        Assert.Equal(SnapshotStatus.TokenExpired, second.Status);
+        Assert.Equal(1, cliCalls);
+
+        clock = clock.AddMinutes(5);
+        var third = await p.FetchAsync(CancellationToken.None);
+        Assert.Equal(SnapshotStatus.TokenExpired, third.Status);
+        Assert.Equal(2, cliCalls);
+    }
+
     [Fact]
     public void Antigravity_without_buckets_is_an_error()
     {
